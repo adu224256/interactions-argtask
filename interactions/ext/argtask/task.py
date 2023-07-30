@@ -7,6 +7,7 @@ from typing import Callable
 import interactions
 from interactions.client.const import get_logger
 from interactions.models.internal.tasks.triggers import BaseTrigger
+import uuid
 
 __all__ = ("Task", "TaskManager")
 
