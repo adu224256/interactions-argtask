@@ -1,14 +1,82 @@
-from interactions import Task as baseTask
-from interactions import BaseTrigger
-from datetime import datetime
-from typing import Callable
-import inspect
 import asyncio
+import inspect
+from asyncio import Task as _Task
+from datetime import datetime, timedelta
+from typing import Callable
+
+import interactions
+from interactions.client.const import get_logger
+from .triggers import BaseTrigger
+
+__all__ = ("Task", "TaskManager")
 
 
-class Task(baseTask):
+class Task:
+    """
+    Create an asynchronous background tasks. Tasks allow you to run code according to a trigger object.
+
+    A task's trigger must inherit from `BaseTrigger`.
+
+    Attributes:
+        callback (Callable): The function to be called when the trigger is triggered.
+        trigger (BaseTrigger): The trigger object that determines when the task should run.
+        task (Optional[_Task]): The task object that is running the trigger loop.
+        iteration (int): The number of times the task has run.
+        uuid (str): The UUID of the task.
+
+    """
+
+    callback: Callable
+    trigger: BaseTrigger
+    task: _Task | None
+    _stop: asyncio.Event
+    iteration: int
+    uuid: str
+
     def __init__(self, callback: Callable, trigger: BaseTrigger) -> None:
-        super().__init__(callback, trigger)
+        self.callback = callback
+        self.trigger = trigger
+        self._stop = asyncio.Event()
+        self.task = None
+        self.iteration = 0
+        self.uuid = str(uuid.uuid4())  # Generate a random UUID for the Task
+
+    @property
+    def started(self) -> bool:
+        """Whether the task is started"""
+        return self.task is not None
+
+    @property
+    def running(self) -> bool:
+        """Whether the task is running"""
+        return self.task is not None and not self.task.done()
+
+    @property
+    def done(self) -> bool:
+        """Whether the task is done/finished"""
+        return self.task is not None and self.task.done()
+
+    @property
+    def next_run(self) -> datetime | None:
+        """Get the next datetime this task will run."""
+        return self.trigger.next_fire() if self.running else None
+
+    @property
+    def delta_until_run(self) -> timedelta | None:
+        """Get the time until the next run of this task."""
+        if not self.running:
+            return None
+
+        next_run = self.next_run
+        return next_run - datetime.now() if next_run is not None else None
+
+    def on_error_sentry_hook(self, error: Exception) -> None:
+        """A dummy method for interactions.ext.sentry to hook"""
+
+    def on_error(self, error: Exception) -> None:
+        """Error handler for this task. Called when an exception is raised during execution of the task."""
+        self.on_error_sentry_hook(error)
+        interactions.Client.default_error_handler("Task", error)
 
     async def __call__(self, *args, **kwargs) -> None:
         try:
@@ -75,3 +143,109 @@ class Task(baseTask):
         """
         self.trigger = trigger
         self.restart(*args, **kwargs)
+
+    @classmethod
+    def create(cls, trigger: BaseTrigger) -> Callable[[Callable], "Task"]:
+        """
+        A decorator to create a task.
+
+        Example:
+            ```python
+            @Task.create(IntervalTrigger(minutes=5))
+            async def my_task():
+                print("It's been 5 minutes!")
+
+            @listen()
+            async def on_startup():
+                my_task.start()
+            ```
+
+        Args:
+            trigger: The trigger to use for this task
+
+        """
+
+        def wrapper(func: Callable) -> "Task":
+            return cls(func, trigger)
+
+        return wrapper
+
+
+class TaskManager:
+    def __init__(self):
+        self.tasks = {}
+
+    def add_task(self, task: Task) -> str:
+        """
+        Add a task to the manager and return its UUID.
+
+        Args:
+            task: The task to be added.
+
+        Returns:
+            str: The UUID of the added task.
+        """
+        task_uuid = task.uuid
+        self.tasks[task_uuid] = task
+        return task_uuid
+
+    def get_task(self, task_uuid: str) -> Task:
+        """
+        Get a task by its UUID.
+
+        Args:
+            task_uuid: The UUID of the task to retrieve.
+
+        Returns:
+            Task: The corresponding Task object.
+        """
+        return self.tasks.get(task_uuid)
+
+    def start_task(self, task_uuid: str, *args, **kwargs) -> None:
+        """
+        Start a task by its UUID.
+
+        Args:
+            task_uuid: The UUID of the task to start.
+            *args: Additional arguments to be passed to the task.
+            **kwargs: Additional keyword arguments to be passed to the task.
+        """
+        task = self.get_task(task_uuid)
+        if task:
+            task.start(*args, **kwargs)
+
+    def stop_task(self, task_uuid: str) -> None:
+        """
+        Stop a task by its UUID.
+
+        Args:
+            task_uuid: The UUID of the task to stop.
+        """
+        task = self.get_task(task_uuid)
+        if task:
+            task.stop()
+
+    def restart_task(self, task_uuid: str, *args, **kwargs) -> None:
+        """
+        Restart a task by its UUID.
+
+        Args:
+            task_uuid: The UUID of the task to restart.
+            *args: Additional arguments to be passed to the task.
+            **kwargs: Additional keyword arguments to be passed to the task.
+        """
+        task = self.get_task(task_uuid)
+        if task:
+            task.restart(*args, **kwargs)
+
+    def reschedule_task(self, task_uuid: str, trigger: BaseTrigger) -> None:
+        """
+        Reschedule a task with a new trigger by its UUID.
+
+        Args:
+            task_uuid: The UUID of the task to reschedule.
+            trigger: The new trigger to use for the task.
+        """
+        task = self.get_task(task_uuid)
+        if task:
+            task.reschedule(trigger)
